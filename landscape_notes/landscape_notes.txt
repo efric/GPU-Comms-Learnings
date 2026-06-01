@@ -1,0 +1,373 @@
+Traditionally multi-GPU communication responsibility of CPU. GPUs thought of as devices that supply large amounts of computation but dependent on CPU for auxillary tasks like communication. More recent: decouple GPU communication from CPUs. Address mismatch between multi-GPU communication and computation.
+
+Useful vocab:
+
+NIC: network interface card; connects one node to network fabric used to reach another node. device that actually places bytes onto network and receives bytes from network
+
+RMA: remote memory access; openSHMEM idea basically
+	-> one particupar performs put/get/atomic access to another participant memory without matching receive.
+	-> Can be intra/inter-node
+
+RDMA: remote direct memory access
+	-> NIC can directly read/write memory on another node without routing payload through remote cpu/os.
+
+UVA = Unified Virtual Addressing:
+cpu and gpu pointers live in single virtual address space; runtime can infer copy direction from addresses instead of direct host->device or device->host
+
+UVM: Unified Virtual Memory: 
+both CPU and GPU can use same pointer and move pages from CPU memory and GPU memory automatically
+
+UVA = common address map
+UVM = managed pages living behind that address map
+
+====
+
+Intra-Note communication: Communication within a node
+	-> Single shared memory host with multiple GPUs. Any given GPU can be controlled by a single thread/process, with a shared memory and process space. 
+
+Components of communication call:
+API. Defines where the communication API call is made by the programmer or library.
+Data path. Indicates who participates in the data movement and shows the corresponding data path.
+
+1. Host Native:
+Who initiates it: Host calls API
+	-> op may be sync or enqueued into stream (ordered queue of GPU work; kernels, async copies, async allocs etc; fifo command buffer) and ordered with kernels in that stream
+Memory transfer path: Data staged through host memory
+Example: hipMemcpy(src_gpu, dst_gpu); hipmemcpyAsync when peer access not enabled (goes through host staging buffer); with p2p is #2.
+
+2. Host Controlled:
+Who initiates it: Host calls API
+Memory transfer path: Device to Device
+Example: hipDeviceEnablePeerAcces -> hipMemcpyPeerAsync; RCCL; GPU Aware MPI; message passing interface
+
+Example pattern (RCCL with direct GPU-GPU):
+
+  produce<<<grid, block, 0, stream>>>(send);
+
+  ncclAllReduce(send, recv, count,
+                ncclFloat32, ncclSum,
+                comm, stream);
+
+  consume<<<grid, block, 0, stream>>>(recv);
+
+
+3. Device Native:
+Who initiates it: Device
+	-> Happen inside kernel
+Memory transfer path: Device to Device:
+Example: rocSHMEM device APIs; direct HIP pointer load/store
+	-> OpenSHMEM like APIs callable from kernel. Each GPU is a PE; memory allocated from symmetric hip on GPU memory; device code can issue puts/gets to another PE
+	-> OpenSHMEM: standardized PGAS style communication model
+		-> PGAS: partitioned global address space. each PE has own local memory but some is made remotely accesible to other PEs.
+		-> One-sided: PE 0 can sendv without PE needing to post reccv
+		-> Symmetric memory: every PE creates corresponding allocation. rocshmem_malloc: all PEs call it, each gets own local allocation of that size. Separate physical allocations but rocSHMEM treats them as corresponding symmetric objects; so kernel can say use local pointer as but target another PE's instance of it
+
+Example (ai):
+__global__ void send_one(float *buf) {
+    int me = rocshmem_my_pe();
+    int peer = (me + 1) % rocshmem_n_pes();
+
+    if (threadIdx.x == 0) {
+      rocshmem_float_p(buf, 42.0f, peer);
+    }
+  }
+
+  That means: from inside the GPU kernel, write value 42.0f to the corresponding buf location on peer.
+
+  For bulk transfer, rocSHMEM has device RMA calls such as:
+
+  rocshmem_putmem(dest, source, nbytes, peer);
+  rocshmem_getmem(dest, source, nbytes, peer);
+
+  ROCm documents these as __device__ APIs. put writes from the calling PE to the remote PE. get reads from the remote PE into the calling PE. The rocSHMEM docs require the relevant addresses to be on the symmetric heap.
+
+  There are also variants:
+
+  _wg: workgroup-cooperative version, called by the whole HIP workgroup.
+  _wave: wavefront-cooperative version.
+  _nbi: nonblocking-immediate; returns once the request is posted, not
+  necessarily globally complete.
+
+	-> Direct pointer load/store: enable peer access, pass pointer allocated on GPU 1 into kernel running on GPU 0; dereference it
+
+4. Host Fallback:
+Who intiiates it: Device
+	-> Happen inside kernel
+Memory transfer path: Data staged through host memory
+Example: host memory fallback. hipMallocManaged falls back to system memory if HMM is not available (HSA_XNACK=0) (allocates mem that both CPU and GPU can access through one pointer)
+	-> https://rocm.docs.amd.com/projects/HIP/en/latest/how-to/hip_runtime_api/memory_management/unified_memory.html
+	-> this idea: managed memory can migrate on page fault; if CPU intiializes x; pages start host side. when GPU kernel touches them driver migrates pages into GPU memory. managed migration. Without HMM; managed allocation is pinned host and access outside origin is zero copy. GPU kernel load/store to x[i] is device initiated but memory is host resident pinned memory
+
+Relevant tech for device-to-device:
+nvidia: nvlink + nvswitch
+	-> nvlink; instead of gpu -> pcie -> host -> pcie -> gpu
+			-> gpu -> nvlink ->gpu
+	-> nvswitch: one gpu may have direct nvlink to another but not every other combination
+		-> nvswitch: act as gpu switch fabric so all gpus can reach each other
+
+amd: infinite fabric / xGMI: up to N GPUs connectd through this and talk to each other ddirectly;
+
+zoom in on p2p direct load/stores; inc rocSHMEM and other device<->device complete
+pros:
+1) inline computation with communication for programmer
+2) can achieve higher levels of bandwidth than (p2p) DMA (cpu enqueues bulk copy; dma moves data gpu -> gpu; rccl path; host controlled intra node case; hipMemcpyPeerAsync)
+3) compute/communication overlap via latency hiding (remote memory)
+4) expand scope of apps that can be gpu accelerated; finer grained primitives
+
+cons: 
+1) comms and comp compete for resources 
+2) more sensitive to non-coalesced memory accesses
+
+so in host controlled device to device (rccl; dma moves bytes into xGMI)
+for direct load/store/device -native; a thread executes load/store and directly move to xGMI aka issues remote load/store
+
+
+=== 
+
+Inter-Node Communication
+
+Node A                                      Node B
+
+  GPU memory -> PCIe/xGMI -> NIC -> network -> NIC -> PCIe/xGMI -> GPU memory
+
+Host Native:
+    CPU API, CPU/NIC setup, CPU-triggered.
+    GPU -> host -> host/NIC buffer -> NIC -> network -> host -> GPU.
+    -> Oldest GPU aware MPI
+
+Pinned Host Native:
+    CPU API, CPU/NIC setup, CPU-triggered.
+    GPU -> pinned host buffer -> NIC -> network -> pinned host buffer -> GPU.
+    -> removes extra host copy (between host to NIC buffer and vice versa)
+    -> RCCL
+
+GPU RDMA:
+    CPU API/setup and trigger.
+    GPU -> NIC -> network -> NIC -> GPU.
+    -> removes host memory from payload path
+    -> ROCmRDMA in GPU-aware MPI, ROCSHMEM
+
+    -> gpu-nic consistent
+    	-> NIC writes data into GPU memory
+	-> Running kernel wants to read that data
+	-> Can kernel safely see the fresh data, in order?
+	-> Nvidia: historically only strong consistency or cpu side mechanisms which is awkward for persistent kernels
+	-> AMD: addressed in rocshmem
+
+GPU-Triggered (depends on rdma):
+    CPU prepares/registers messages.
+    GPU triggers pre pared communication
+    GPU -> NIC -> network -> NIC -> GPU.
+    -> removes CPU from triggering
+    -> ROCSHMEM
+
+Device Native (depends on rdma):
+    GPU-side API and per-message control.
+    GPU constructs/triggers communication.
+    GPU -> NIC -> network -> NIC -> GPU.
+    -> removes CPU almost completely
+
+====
+
+GPU-Centric Communciation Libraries:
+
+  GPU-aware MPI is an evolutionary bridge; used in HPC
+
+  Before GPU-aware MPI: (host native)
+    programmer manually stages GPU data through host buffers.
+
+  Early GPU-aware MPI: (host native)
+    MPI accepts GPU pointers but may still stage internally through host memory.
+
+  Better intra-node GPU-aware MPI: (host controlled)
+    MPI uses IPC/P2P paths:
+    GPU -> GPU inside the node.
+
+#include <stdio.h>
+#include <hip/hip_runtime.h>
+#include <mpi.h>
+
+int main(int argc, char **argv) {
+  int i,rank,size,bufsize;
+  int *h_buf;
+  int *d_buf;
+  MPI_Status status;
+
+  bufsize=100;
+
+  MPI_Init(&argc,&argv);
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+  //allocate buffers
+  h_buf=(int*) malloc(sizeof(int)*bufsize);
+  hipMalloc(&d_buf, bufsize*sizeof(int));
+
+  //initialize buffers
+  if(rank==0) {
+    for(i=0;i<bufsize;i++)
+      h_buf[i]=i;
+  }
+
+  if(rank==1) {
+    for(i=0;i<bufsize;i++)
+      h_buf[i]=-1;
+  }
+
+  hipMemcpy(d_buf, h_buf, bufsize*sizeof(int), hipMemcpyHostToDevice);
+
+  //communication
+  if(rank==0)
+    MPI_Send(d_buf, bufsize, MPI_INT, 1, 123, MPI_COMM_WORLD);
+
+  if(rank==1)
+    MPI_Recv(d_buf, bufsize, MPI_INT, 0, 123, MPI_COMM_WORLD, &status);
+
+  //validate results
+  if(rank==1) {
+    hipMemcpy(h_buf, d_buf, bufsize*sizeof(int), hipMemcpyDeviceToHost);
+    for(i=0;i<bufsize;i++) {
+      if(h_buf[i] != i)
+        printf("Error: buffer[%d]=%d but expected %d\n", i, h_buf[i], i);
+      }
+    fflush(stdout);
+  }
+
+  //free buffers
+  free(h_buf);
+  hipFree(d_buf);
+
+  MPI_Finalize();
+}
+
+  Better inter-node GPU-aware MPI:
+    MPI uses GPU RDMA:
+    GPU -> NIC -> network -> NIC -> GPU.
+
+AMD: https://rocm.blogs.amd.com/software-tools-optimization/gpu-aware-mpi/README.html
+OpenMPI, Cray MPICH
+
+GPU-Centric Collectives (GPUCCL); amd rccl
+Collective: grouo of operations across many ranks/GPUs
+
+AllReduce:     every GPU contributes data; every GPU gets reduced result
+AllGather:     every GPU contributes a shard; every GPU gets all shards
+ReduceScatter: every GPU contributes full data; every GPU gets one reduced shard
+Broadcast:     one GPU sends same data to all
+
+in gpu aware MPI:
+	kernels do local reduce then cpu initiated copies (could still be device to device) and possibly intermediate host buffers (host native).
+rccl instead tries to fuse collective communication and computation to gpu side execution. 
+
+gpu aware MPi solved having MPI handle GPU buffers
+GPUCCL solves: can whole collective algorithm be designed around GPU execution and GPU interconnect topology
+
+GPU aware MPI:
+  launch local reduction kernel
+  <enter cpu mode>
+  wait/sync
+  issue copy/send
+  wait/sync
+  <exit cpu mode>
+  launch another reduction kernel
+  ...
+
+RCCL/NCCL style is more like:
+  CPU enqueues one collective
+  GPU collective kernel runs
+  buffer is split into chunks
+  GPU repeatedly:
+    receives/sends chunks
+    reduces chunks
+    forwards chunks
+  result is built through a pipelined algorithm
+
+so less dependency on CPU
+
+For an AllReduce, the mental model is often:
+
+  1. Split tensor into chunks.
+
+  2. Reduce-scatter phase:
+     each GPU sends/receives chunks around a ring/tree,
+     reducing chunks as they arrive.
+
+  3. Allgather phase:
+     reduced chunks are circulated so every GPU gets the full result.
+
+rings, trees etc: communication schedule
+
+rings: GPU0 -> GPU1 -> GPU2 -> GPU3 -> GPU0
+trees:
+hierarchical:
+
+GPU-centric OPENSHMEM
+
+many PEs (gpus), usually one PE per GPU
+each PE owns local GPU memory
+some memory is allocated symmetrically across all PEs
+GPU can directly put/get data from another PE's symmetric memory
+
+symmetric heap: all PEs allocate corresponding objects.
+ buf = rocshmem_malloc(N);
+
+then each PE has its own local buf, but SHMEM can identify “the corresponding buf on PE33.” All PEs allocate same amount too.
+
+SHMEM is one side unlike MPI/RCCL
+
+Device native:
+
+Intra-node:
+
+  GPU kernel calls rocshmem_put/get
+  data moves over xGMI / Infinity Fabric / PCIe P2P / NVLink
+
+  Inter-node:
+
+  GPU kernel calls rocshmem_put/get
+  data may move GPU -> NIC -> network -> NIC -> GPU
+
+  But there is an important backend caveat. The paper says ROC_SHMEM has:
+
+  GPU-IB:
+    GPU-side InfiniBand path, default/best performance.
+
+  Reverse Offload (back up ):
+    GPU issues operation, but host proxy threads perform communication.
+
+GPU kernel itself runs communication logic
+GPU threads issue put/get/signal/wait operations
+chunks can be reduced and exchanged from inside kernel
+
+GPUSHMEM is useful when communication is dynamic or more finegrained than RCCL primitives
+
+inside this kernel, send only if condition holds
+  send variable-sized or sparse data
+  communicate with a subset of peers
+  overlap by assigning some thread blocks to communication
+  avoid returning to CPU between algorithm iterations
+
+===
+
+4.4 Comparison and Discussion of User-Level Libraries
+
+Streams: MPI has a semantic mismatch with GPU streams. Standard MPI calls are not
+naturally enqueued on a HIP/CUDA stream, so correct code may need host synchronization.
+RCCL/NCCL and SHMEM host APIs are stream-aware; device-side SHMEM can avoid the host/
+stream mismatch by communicating inside the kernel.
+
+ API location: MPI and GPUCCL are normally host APIs. GPUSHMEM has host and device APIs.
+That means SHMEM arguments can be device-computed values inside a kernel, not just host-
+known count/type/op.
+
+Performance: there is no universal winner. The paper summarizes: MPI can be strong for
+point-to-point, *CCL tends to be strong for collectives, and SHMEM-style GPU-initiated
+communication is attractive for irregular/fine-grained workloads. Reduction collectives
+in MPI can be bad if they fall back to host staging/CPU reduction, while native GPU
+collective libraries reduce directly on the GPU
+	* point to point: 1 gpu to another gpu. 
+
+Library interactions: the stack is not one clean vertical line. libraries often call each other. MPI may offload collectives to GPUCCL. GPUSHMEM may use UCX for point-to-point and GPUCCL for collectives. UCC may choose among UCX, RCCL/NCCL, or other collective backends.
+
+UCX: unified communication X. transport layer via different mechanisms. 
+UCC: framework for collective ops
