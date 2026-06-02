@@ -102,6 +102,9 @@ Relevant tech for device-to-device:
 nvidia: nvlink + nvswitch
 	-> nvlink; instead of gpu -> pcie -> host -> pcie -> gpu
 			-> gpu -> nvlink ->gpu
+	-> gpu interconnect for inter-node; operation using nvlink may or may not consume gpu compute resources 
+		-> host controlled (host initiate; device e2e mem): p2p dma over nvlink is host controlled and avoid compute resources
+		-> device native (device initiate; device e2e mem): direct load/store, nvshmem style, nccl collective kernels are device side and do consume some gpu resources
 	-> nvswitch: one gpu may have direct nvlink to another but not every other combination
 		-> nvswitch: act as gpu switch fabric so all gpus can reach each other
 
@@ -436,4 +439,10 @@ In other words:
         -> UCX / UCC / vendor runtime / transport layer
             -> GPUDirect / ROCm P2P / RDMA / driver + NIC mechanisms
 
+Misc:
+Topological differences between Nvidia and AMD
+NVLink + NVSwitch
+AMD: xGMI/Infinite fabric
+	-> e.g MI300; 8-GPU mi300 has dedicated infinite fabric links between each pair
+	-> https://rocmdocs.amd.com/projects/rccl/en/latest/how-to/rccl-usage-tips.html
 
