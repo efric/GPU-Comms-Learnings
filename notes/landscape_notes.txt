@@ -301,6 +301,10 @@ rings: GPU0 -> GPU1 -> GPU2 -> GPU3 -> GPU0
 trees:
 hierarchical:
 
+NCCL now has device API; RCCL only host rn
+
+
+
 GPU-centric OPENSHMEM
 
 many PEs (gpus), usually one PE per GPU
@@ -347,6 +351,28 @@ inside this kernel, send only if condition holds
   overlap by assigning some thread blocks to communication
   avoid returning to CPU between algorithm iterations
 
+
+NCCL Device API:
+    lower-level NCCL building blocks for custom fused communication kernels,
+    especially collectives/reduce/copy patterns.
+
+  NVSHMEM:
+    full PGAS/OpenSHMEM programming model:
+    one-sided put/get/atomics/signals/waits over symmetric memory.
+
+  For AllReduce:
+
+  NCCL Device API:
+    You build or use reduce/copy/fused building blocks inside a custom kernel.
+    Strong fit for fused GEMM+AllReduce or custom collective kernels.
+
+  NVSHMEM:
+    You can implement an allreduce using put/get/signal/wait,
+    or use NVSHMEM collective APIs where appropriate.
+    Strong fit when communication is fine-grained, irregular, or embedded in a persistent
+    kernel.
+
+
 ===
 
 4.4 Comparison and Discussion of User-Level Libraries
@@ -362,7 +388,7 @@ known count/type/op.
 
 Performance: there is no universal winner. The paper summarizes: MPI can be strong for
 point-to-point, *CCL tends to be strong for collectives, and SHMEM-style GPU-initiated
-communication is attractive for irregular/fine-grained workloads. Reduction collectives
+communication is attractive for irregular/fine-grained workloads (bfs, distributed bloom filter etc). Reduction collectives
 in MPI can be bad if they fall back to host staging/CPU reduction, while native GPU
 collective libraries reduce directly on the GPU
 	* point to point: 1 gpu to another gpu. 
@@ -370,4 +396,44 @@ collective libraries reduce directly on the GPU
 Library interactions: the stack is not one clean vertical line. libraries often call each other. MPI may offload collectives to GPUCCL. GPUSHMEM may use UCX for point-to-point and GPUCCL for collectives. UCC may choose among UCX, RCCL/NCCL, or other collective backends.
 
 UCX: unified communication X. transport layer via different mechanisms. 
-UCC: framework for collective ops
+UCC: open source framework for collective ops
+
+                           +-------------+
+                           | Application |
+                           +-------------+
+                            /     |     \
+                           /      |      \
+                          v       v       v
+
++---------+          +-----------+          +----------+
+|   MPI   | -------> |  GPUCCL   | <------- | GPUSHMEM |
++---------+          +-----------+          +----------+
+     |                   |    |                  |
+     |                   |    |                  |
+     v                   v    v                  v
++---------+          +-------------------------------+
+|   UCC   | -------> |              UCX              |
++---------+          +-------------------------------+
+     |                             |
+     |                             |
+     +-------------+---------------+
+                   |
+                   v
+
++----------------------------------------------------+
+| libfabric | libibverbs | sockets | shared mem ... |
++----------------------------------------------------+
+                           |
+                           v
+
++----------------------------------------------------+
+| Hardware (NVLink, InfinityFabric, NVSwitch, ...)  |
++----------------------------------------------------+
+
+In other words:
+  Application
+    -> MPI / RCCL / NCCL / NVSHMEM / ROC_SHMEM
+        -> UCX / UCC / vendor runtime / transport layer
+            -> GPUDirect / ROCm P2P / RDMA / driver + NIC mechanisms
+
+
